@@ -13,6 +13,7 @@ import shutil
 import aiofiles
 from ascii_colors import trace_exception
 import nest_asyncio
+from docling.document_converter import DocumentConverter
 
 import os
 
@@ -96,7 +97,7 @@ def parse_args():
 class DocumentManager:
     """Handles document operations and tracking"""
 
-    def __init__(self, input_dir: str, supported_extensions: tuple = (".txt", ".md")):
+    def __init__(self, input_dir: str, supported_extensions: tuple = (".txt", ".md", ".pdf", ".docx", ".pptx", ".csv")):
         self.input_dir = Path(input_dir)
         self.supported_extensions = supported_extensions
         self.indexed_files = set()
@@ -189,6 +190,9 @@ def create_app(args):
     logging.basicConfig(
         format="%(levelname)s:%(message)s", level=getattr(logging, args.log_level)
     )
+
+    # Initialize document converter
+    converter = DocumentConverter()
 
     # Check if API key is provided either through env var or args
     api_key = os.getenv("LIGHTRAG_API_KEY") or args.key
@@ -321,11 +325,26 @@ def create_app(args):
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
-            # Immediately index the uploaded file
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
+            # Process and index the uploaded file based on its type
+            try:
+                if file.filename.endswith((".txt", ".md")):
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                else:
+                    # Use docling for other supported file types
+                    result = converter.convert(str(file_path))
+                    content = result.document.export_to_markdown()
+
                 rag.insert(content)
                 doc_manager.mark_as_indexed(file_path)
+
+            except Exception as e:
+                # Clean up the file if processing fails
+                file_path.unlink()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to process file: {str(e)}"
+                )
 
             return {
                 "status": "success",
@@ -402,22 +421,44 @@ def create_app(args):
     )
     async def insert_file(file: UploadFile = File(...), description: str = Form(None)):
         try:
-            content = await file.read()
-
-            if file.filename.endswith((".txt", ".md")):
-                text = content.decode("utf-8")
-                rag.insert(text)
-            else:
+            if not doc_manager.is_supported_file(file.filename):
                 raise HTTPException(
                     status_code=400,
-                    detail="Unsupported file type. Only .txt and .md files are supported",
+                    detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
                 )
 
-            return InsertResponse(
-                status="success",
-                message=f"File '{file.filename}' successfully inserted",
-                document_count=1,
-            )
+            # Save the file temporarily
+            temp_file_path = doc_manager.input_dir / file.filename
+            content = await file.read()
+
+            with open(temp_file_path, "wb") as buffer:
+                buffer.write(content)
+
+            try:
+                if file.filename.endswith((".txt", ".md")):
+                    with open(temp_file_path, "r", encoding="utf-8") as f:
+                        text = f.read()
+                else:
+                    # Use docling for other supported file types
+                    result = converter.convert(str(temp_file_path))
+                    text = result.document.export_to_markdown()
+
+                rag.insert(text)
+
+                # Clean up temporary file
+                temp_file_path.unlink()
+
+                return InsertResponse(
+                    status="success",
+                    message=f"File '{file.filename}' successfully inserted",
+                    document_count=1,
+                )
+            except Exception as e:
+                # Clean up temporary file if processing fails
+                if temp_file_path.exists():
+                    temp_file_path.unlink()
+                raise e
+
         except UnicodeDecodeError:
             raise HTTPException(status_code=400, detail="File encoding not supported")
         except Exception as e:
@@ -434,15 +475,36 @@ def create_app(args):
             failed_files = []
 
             for file in files:
+                if not doc_manager.is_supported_file(file.filename):
+                    failed_files.append(f"{file.filename} (unsupported type)")
+                    continue
+
                 try:
+                    # Save the file temporarily
+                    temp_file_path = doc_manager.input_dir / file.filename
                     content = await file.read()
+
+                    with open(temp_file_path, "wb") as buffer:
+                        buffer.write(content)
+
                     if file.filename.endswith((".txt", ".md")):
-                        text = content.decode("utf-8")
-                        rag.insert(text)
-                        inserted_count += 1
+                        with open(temp_file_path, "r", encoding="utf-8") as f:
+                            text = f.read()
                     else:
-                        failed_files.append(f"{file.filename} (unsupported type)")
+                        # Use docling for other supported file types
+                        result = converter.convert(str(temp_file_path))
+                        text = result.document.export_to_markdown()
+
+                    rag.insert(text)
+                    inserted_count += 1
+
+                    # Clean up temporary file
+                    temp_file_path.unlink()
+
                 except Exception as e:
+                    # Clean up temporary file if processing fails
+                    if temp_file_path.exists():
+                        temp_file_path.unlink()
                     failed_files.append(f"{file.filename} ({str(e)})")
 
             status_message = f"Successfully inserted {inserted_count} documents"

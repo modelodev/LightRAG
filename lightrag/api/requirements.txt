@@ -1,5 +1,6 @@
 aioboto3
 ascii_colors
+docling
 fastapi
 lightrag-hku
 nano_vectordb
